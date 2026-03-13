@@ -46,6 +46,43 @@ cargo build
 ## Contributing
 We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to get started.
 
+## Benchmarks
+The repository includes isolated Criterion benchmarks for:
+
+- DKG
+- Sign
+- Refresh (complete)
+
+Run all benchmarks:
+
+```bash
+cargo bench
+```
+
+Run one benchmark target:
+
+```bash
+cargo bench --bench bench_dkg
+cargo bench --bench bench_sign
+cargo bench --bench bench_refresh
+```
+
+Configure threshold and party count globally for all benchmarks:
+
+```bash
+DKLS_BENCH_T=3 DKLS_BENCH_N=5 cargo bench
+```
+
+Rules:
+
+- `DKLS_BENCH_T >= 2`
+- `DKLS_BENCH_N >= 2`
+- `DKLS_BENCH_T <= DKLS_BENCH_N`
+
+Criterion artifacts are written under `target/criterion/`.
+These include HTML reports and machine-readable files (JSON/CSV-like raw data)
+that can be used for external plotting if needed.
+
 ## Security
 For information on how to report security vulnerabilities, please see our [SECURITY.md](SECURITY.md).
 
