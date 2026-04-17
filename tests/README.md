@@ -1,6 +1,6 @@
 # End-to-End Tests
 
-Integration tests exercising the full DKLs23 threshold ECDSA lifecycle: distributed key generation, signing, key refresh, and node recovery.
+Integration tests exercising the full DKLs23 threshold ECDSA lifecycle: distributed key generation, signing, and key refresh — plus operational scenarios like node failover and recovery.
 
 ## Running
 
