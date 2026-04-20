@@ -24,8 +24,10 @@ use dkls23::protocols::dkg::compute_eth_address;
 use dkls23::protocols::re_key::re_key;
 use dkls23::protocols::{Parameters, Party, PartyIndex};
 use dkls23::utilities::hashes::tagged_hash;
+use dkls23::utilities::rng;
 use dkls23::utilities::zero_shares::ZeroShare;
 use k256::elliptic_curve::sec1::ToSec1Point;
+use k256::elliptic_curve::Field;
 use k256::Scalar;
 
 const THRESHOLD: u8 = 3;
@@ -366,6 +368,88 @@ fn reconstruct_secret(shares: &[(u8, Scalar)]) -> Scalar {
     lagrange_interpolate_at(shares, 0)
 }
 
+/// MPC-style Lagrange interpolation using pairwise additive masks.
+///
+/// Simulates the distributed protocol where each surviving party holds ONLY
+/// its own share and never learns the others' shares. The flow is:
+///
+/// 1. Each party `i` computes its term locally: `tᵢ = yᵢ · Lᵢ(target)`.
+///    The Lagrange coefficient `Lᵢ(target)` uses only PUBLIC information
+///    (the x-coordinates of the surviving parties and the target index),
+///    so no secret leaves the node at this step.
+///
+/// 2. Each pair of surviving parties `(i, j)` with `i < j` agrees on a
+///    random scalar `r_{ij}` (in a real deployment, via a pairwise secure
+///    channel — e.g. ECDH). Party `i` adds `+r_{ij}` to its term; party
+///    `j` adds `-r_{ij}`. The sum across all parties cancels every mask.
+///
+/// 3. Each party broadcasts its masked term to the recipient only. From a
+///    single masked value, nobody (not even the recipient) can recover the
+///    underlying share — the random mask acts as a one-time pad.
+///
+/// 4. The recipient sums the masked terms. The pairwise masks cancel out,
+///    leaving exactly `Σᵢ tᵢ = f(target)`. Only the recipient learns this
+///    value; the other participants never see the sum.
+///
+/// This is the same "pairwise zero-share" trick used internally by DKLs23
+/// for its zero_shares module during signing.
+fn lagrange_mpc_at_target(shares: &[(u8, Scalar)], target_x: u8) -> Scalar {
+    let x_target = Scalar::from(u32::from(target_x));
+    let n = shares.len();
+
+    // --- Step 1: each party computes its own term locally (uses only its
+    //     own yᵢ and the public x-coordinates of all participants) -------
+    let local_terms: Vec<Scalar> = (0..n)
+        .map(|i| {
+            let (xi, yi) = shares[i];
+            let xi_scalar = Scalar::from(u32::from(xi));
+            let mut lagrange = Scalar::ONE;
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let xj_scalar = Scalar::from(u32::from(shares[j].0));
+                let num = x_target - xj_scalar;
+                let den = xi_scalar - xj_scalar;
+                let den_inv: Scalar = Option::from(den.invert()).expect("non-zero denominator");
+                lagrange *= num * den_inv;
+            }
+            yi * lagrange
+        })
+        .collect();
+
+    // --- Step 2: pairwise random masks r_{ij} for i < j ------------------
+    // pair_mask[i][j] holds the signed mask party i adds for its pairing
+    // with party j: +r for i<j, -r for i>j. Sum over all parties cancels.
+    let mut pair_mask: Vec<Vec<Scalar>> = vec![vec![Scalar::ZERO; n]; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let r = Scalar::random(&mut rng::get_rng());
+            pair_mask[i][j] = r;
+            pair_mask[j][i] = -r;
+        }
+    }
+
+    // --- Step 3: each party broadcasts its masked term to the recipient --
+    let masked_terms: Vec<Scalar> = (0..n)
+        .map(|i| {
+            let mut masked = local_terms[i];
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                masked += pair_mask[i][j];
+            }
+            masked
+        })
+        .collect();
+
+    // --- Step 4: recipient sums the masked terms; masks cancel pairwise --
+    masked_terms
+        .iter()
+        .fold(Scalar::ZERO, |acc, t| acc + t)
+}
+
 /// Build a "hollow" Party — correct poly_point but empty OT/zero-share state.
 /// This party is NOT capable of signing, but CAN participate in a complete
 /// refresh (which rebuilds all cryptographic state from scratch).
@@ -608,8 +692,10 @@ fn test_3of5_operational_backup_failover() {
     //
     //     This is safer than scenario 10 because the secret key f(0) is NEVER
     //     reconstructed — only the individual share f(2) is computed.
-    //     In production, even this interpolation could be done via MPC so that
-    //     no single node learns f(2).
+    //     Additionally, the interpolation itself runs as a simulated MPC:
+    //     each survivor computes its own Lagrange term with pairwise-random
+    //     masks that cancel in the final sum, so no single node (other than
+    //     party 2, the recipient) ever learns f(2).
     // -----------------------------------------------------------------------
     println!("\n[scenario] === HOLLOW PARTY REPLACEMENT via complete refresh ===");
 
@@ -625,9 +711,26 @@ fn test_3of5_operational_backup_failover() {
         })
         .collect();
 
-    // Reconstruct ONLY the missing share at x=2 (NOT the secret at x=0)
-    let reconstructed_share_2 = lagrange_interpolate_at(&survivor_shares, 2);
-    println!("  [hollow] reconstructed poly_point for party 2 via Lagrange at x=2");
+    // Reconstruct ONLY the missing share at x=2 (NOT the secret at x=0),
+    // and do it via simulated MPC: each survivor computes its own Lagrange
+    // term locally, masks it with pairwise randomness that cancels in the
+    // sum, and only the recipient (party 2) learns the final value.
+    println!(
+        "  [hollow] running MPC interpolation at x=2 across survivors {:?}...",
+        survivor_shares.iter().map(|(i, _)| *i).collect::<Vec<_>>()
+    );
+    let reconstructed_share_2 = lagrange_mpc_at_target(&survivor_shares, 2);
+
+    // Sanity check: the MPC protocol must produce the same scalar as the
+    // direct (centralized) interpolation. The difference is only in WHO
+    // gets to see intermediate values during the computation.
+    let direct_share_2 = lagrange_interpolate_at(&survivor_shares, 2);
+    assert_eq!(
+        reconstructed_share_2, direct_share_2,
+        "MPC interpolation must agree with the direct computation"
+    );
+    println!("  [hollow] MPC result matches direct interpolation ✓");
+    println!("  [hollow] reconstructed poly_point for party 2 (only party 2 sees this value)");
 
     // Build a hollow Party 2 — correct share, but no OT/zero-share state
     let template = &refreshed2[0]; // any surviving party as template for metadata
